@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# Local data / artifacts
+stock.db
+*.db
+*.csv
+
+# Jupyter / misc
+.ipynb_checkpoints/
+.DS_Store
