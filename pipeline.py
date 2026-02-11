@@ -4,12 +4,16 @@ import sqlite3
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
+import urllib.request
+import urllib.error
+
 from datetime import datetime, timezone, date, timedelta  # add date, timedelta
 
-
+#constants
 SAFETY_DAYS = 10
 DB_PATH = "stock.db"
 PROVIDER = "stooq"
+DATA_DIR = Path("data")
 
 
 def utc_now_iso() -> str:
@@ -492,8 +496,11 @@ def mark_removed_watchlist(conn: sqlite3.Connection, provider: str, provider_sym
       WHERE provider = ? AND provider_symbol = ?;
     """, (removed_at, provider, provider_symbol))
 
-def run_one_symbol(conn: sqlite3.Connection, provider_symbol: str, csv_path: str, run_id: str) -> None:
-    # 1) Determine incremental window from watermark
+def run_one_symbol(conn: sqlite3.Connection, provider_symbol: str, run_id: str) -> None:
+    # 1) Extract latest CSV for this symbol
+    csv_path = extract_stooq_csv(provider_symbol)
+    
+    # 2) Determine incremental window from watermark
     last_success = get_last_success_date(conn, PROVIDER, provider_symbol)
     if last_success is None:
         date_from = "1900-01-01"
@@ -503,12 +510,12 @@ def run_one_symbol(conn: sqlite3.Connection, provider_symbol: str, csv_path: str
 
     print(f"\n=== {provider_symbol} window: {date_from} to {date_to} ===")
 
-    # 2) Run pipeline steps for this symbol
+    # 3) Run pipeline steps for this symbol
     raw_count = load_csv_to_raw(conn, csv_path, provider_symbol, run_id, date_from, date_to)
     stg_count = rebuild_staging_for_run(conn, run_id)  # staging is run-scoped in your design
     ins, upd, same = merge_stg_to_curated(conn, run_id)
 
-    # 3) Update watermark on success
+    # 4) Update watermark on success
     max_date = conn.execute("""
         SELECT MAX(trading_date)
         FROM cur_daily_prices
@@ -580,6 +587,60 @@ def upsert_watchlist_symbol(conn: sqlite3.Connection, provider: str, provider_sy
     """, (provider, provider_symbol, now, notes))
     conn.commit()
 
+def stooq_symbol_for_url(provider_symbol: str) -> str:
+    """
+    Stooq expects lowercase symbols in the URL, e.g. 'AAPL.US' -> 'aapl.us'
+    """
+    return provider_symbol.strip().lower()
+
+
+def csv_path_for_symbol(provider_symbol: str) -> str:
+    """
+    Your file naming convention: 'AAPL.US' -> 'data/aapl_us_d.csv'
+    """
+    safe = provider_symbol.strip().lower().replace(".", "_")
+    return str(DATA_DIR / f"{safe}_d.csv")
+
+
+def stooq_daily_csv_url(provider_symbol: str) -> str:
+    """
+    Stooq daily CSV endpoint:
+    https://stooq.com/q/d/l/?s=aapl.us&i=d
+    """
+    s = stooq_symbol_for_url(provider_symbol)
+    return f"https://stooq.com/q/d/l/?s={s}&i=d"
+
+
+def extract_stooq_csv(provider_symbol: str) -> str:
+    """
+    Downloads the daily CSV for provider_symbol into data/ and returns the local path.
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    url = stooq_daily_csv_url(provider_symbol)
+    out_path = csv_path_for_symbol(provider_symbol)
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; daily-stock-pipeline/1.0)"}
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read()
+
+        # Stooq sometimes returns an HTML error page; quick sanity check.
+        if not content or b"<html" in content[:200].lower():
+            raise RuntimeError(f"Unexpected response when downloading {provider_symbol} from Stooq.")
+
+        Path(out_path).write_bytes(content)
+        return out_path
+
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP error downloading {provider_symbol}: {e.code} {e.reason}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error downloading {provider_symbol}: {e.reason}") from e
+
 def main():
     run_id = make_run_id()
 
@@ -593,20 +654,16 @@ def main():
             raise ValueError("No active symbols in watchlist_symbols.")
 
         for sym in symbols:
-            #For now, map sym -> csv_path manually
-            csv_path = f"{sym.lower().replace('.', '_')}_d.csv" #e.g., APPL.US -> appl_us_d.csv
-
             try:
-                run_one_symbol(conn, sym, csv_path, run_id)
+                run_one_symbol(conn, sym, run_id)
             except Exception as e:
                 upsert_watermark_failed(conn, PROVIDER, sym, run_id, utc_now_iso())
                 conn.commit()
                 print(f"!!! FAILED symbol {sym}: {e}")
-                raise
+                #keep going for other symbols
+                continue
                 
         
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--add-symbol")
