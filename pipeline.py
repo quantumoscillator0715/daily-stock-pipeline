@@ -614,11 +614,19 @@ def stooq_daily_csv_url(provider_symbol: str) -> str:
 def extract_stooq_csv(provider_symbol: str) -> str:
     """
     Downloads the daily CSV for provider_symbol into data/ and returns the local path.
+    Uses a cache check + atomic write to avoid partial/corrupt files.
     """
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     url = stooq_daily_csv_url(provider_symbol)
     out_path = csv_path_for_symbol(provider_symbol)
+
+    out_p = Path(out_path)
+
+    # 1) Cache: if we already have a non-trivial file, reuse it
+    if out_p.exists() and out_p.stat().st_size > 100:
+        print(f"cached: {provider_symbol} -> {out_path}")
+        return out_path
 
     req = urllib.request.Request(
         url,
@@ -629,11 +637,21 @@ def extract_stooq_csv(provider_symbol: str) -> str:
         with urllib.request.urlopen(req, timeout=30) as resp:
             content = resp.read()
 
-        # Stooq sometimes returns an HTML error page; quick sanity check.
-        if not content or b"<html" in content[:200].lower():
+        # 2) Stooq sometimes returns an HTML error page; quick sanity check.
+        head = content[:300].lower()
+        if (
+            not content
+            or b"<html" in head
+            or b"<!doctype html" in head
+        ):
             raise RuntimeError(f"Unexpected response when downloading {provider_symbol} from Stooq.")
 
-        Path(out_path).write_bytes(content)
+        # 3) Atomic write: write to .tmp then rename into place
+        tmp_path = out_p.with_suffix(out_p.suffix + ".tmp")  # e.g. aapl_us_d.csv.tmp
+        tmp_path.write_bytes(content)
+        tmp_path.replace(out_p)
+
+        print(f"downloaded: {provider_symbol} -> {out_path} ({len(content)} bytes)")
         return out_path
 
     except urllib.error.HTTPError as e:
