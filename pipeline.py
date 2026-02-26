@@ -147,6 +147,42 @@ def init_db(conn: sqlite3.Connection) -> None:
       CHECK (is_active IN (0,1))
     );
     """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS run_log (
+      run_id          TEXT PRIMARY KEY,
+      started_at      TEXT NOT NULL,
+      ended_at        TEXT,
+      status          TEXT NOT NULL,
+      symbols_total   INTEGER NOT NULL,
+      symbols_success INTEGER NOT NULL,
+      symbols_failed  INTEGER NOT NULL,
+      CHECK (status IN ('success', 'failed', 'partial'))
+    );
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS run_symbol_log (
+      run_id          TEXT NOT NULL,
+      provider        TEXT NOT NULL,
+      provider_symbol TEXT NOT NULL,
+      status          TEXT NOT NULL,
+      date_from       TEXT NOT NULL,
+      date_to         TEXT NOT NULL,
+      raw_count       INTEGER NOT NULL,
+      stg_count       INTEGER NOT NULL,
+      ins             INTEGER NOT NULL,
+      upd             INTEGER NOT NULL,
+      same            INTEGER NOT NULL,
+      error_message   TEXT,
+      started_at      TEXT NOT NULL,
+      ended_at        TEXT,
+      PRIMARY KEY (run_id, provider, provider_symbol),
+      CHECK (status IN ('success', 'failed', 'partial'))
+    );
+    """)
+      
+      
     
     conn.commit()
 
@@ -223,18 +259,18 @@ def load_csv_to_raw(conn: sqlite3.Connection, csv_path: str, provider_symbol: st
     return cur.fetchone()[0]
 
 
-def rebuild_staging_for_run(conn: sqlite3.Connection, run_id: str) -> int:
+def rebuild_staging_for_run_symbol(conn: sqlite3.Connection, run_id: str, provider_symbol: str) -> int:
     """
-    Rebuild STG from RAW for the given run_id:
-    - dedupe by (provider, provider_symbol, trading_date)
-    - pick latest ingested_at, tie-break on raw_id
+    Rebuild STG for ONE symbol and ONE run_id.
     """
     stg_ingested_at = utc_now_iso()
 
-    # Clear staging (simple, common pattern)
-    conn.execute("DELETE FROM stg_daily_prices;")
+    # Delete by provider + symbol (because STG PK does not include run_id)
+    conn.execute("""
+        DELETE FROM stg_daily_prices
+        WHERE provider = ? AND provider_symbol = ?;
+    """, (PROVIDER, provider_symbol))
 
-    # Insert deduped rows for this run_id
     conn.execute("""
     INSERT INTO stg_daily_prices (
       provider, provider_symbol, trading_date,
@@ -265,21 +301,29 @@ def rebuild_staging_for_run(conn: sqlite3.Connection, run_id: str) -> int:
         COUNT(*) AS raw_row_count
       FROM raw_stooq_daily_prices
       WHERE run_id = ?
+        AND provider = ?
+        AND provider_symbol = ?
       GROUP BY provider, provider_symbol, trading_date
     ) x
       ON r.provider = x.provider
      AND r.provider_symbol = x.provider_symbol
      AND r.trading_date = x.trading_date
      AND r.ingested_at = x.raw_max_ingested_at
-    WHERE r.run_id = ?;
-    """, (stg_ingested_at, run_id, run_id))
+    WHERE r.run_id = ?
+      AND r.provider = ?
+      AND r.provider_symbol = ?;
+    """, (stg_ingested_at, run_id, PROVIDER, provider_symbol, run_id, PROVIDER, provider_symbol))
 
     conn.commit()
 
-    cur = conn.execute("SELECT COUNT(*) FROM stg_daily_prices WHERE run_id = ?;", (run_id,))
+    cur = conn.execute("""
+        SELECT COUNT(*)
+        FROM stg_daily_prices
+        WHERE run_id = ? AND provider = ? AND provider_symbol = ?;
+    """, (run_id, PROVIDER, provider_symbol))
     return cur.fetchone()[0]
 
-def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str) -> tuple[int, int, int]:
+def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str, provider_symbol: str) -> tuple[int, int, int]:
     """
     Merge STG rows for a given run_id into CUR (latest-state table).
 
@@ -289,8 +333,8 @@ def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str) -> tuple[int, in
       - unchanged_rows: existing key and row_hash same -> only refresh last_ingested_at/last_run_id
     """
 
-    # 1) Safety check: STG must have rows for this run_id, otherwise merge is a no-op silently.
-    cur = conn.execute("SELECT COUNT(*) FROM stg_daily_prices WHERE run_id = ?;", (run_id,))
+    # 1) Safety check per symbol
+    cur = conn.execute("SELECT COUNT(*) FROM stg_daily_prices WHERE run_id = ? AND provider_symbol = ?;", (run_id, provider_symbol))
     stg_count = cur.fetchone()[0]
     if stg_count == 0:
         raise ValueError(f"No staging rows found for run_id={run_id}. Did you rebuild staging?")
@@ -311,6 +355,7 @@ def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str) -> tuple[int, in
       0, 0
     FROM stg_daily_prices s
     WHERE s.run_id = ?
+      AND s.provider_symbol = ?
       AND NOT EXISTS (
         SELECT 1
         FROM cur_daily_prices c
@@ -318,112 +363,61 @@ def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str) -> tuple[int, in
           AND c.provider_symbol = s.provider_symbol
           AND c.trading_date = s.trading_date
       );
-    """, (run_id,))
+    """, (run_id, provider_symbol))
     inserted = conn.execute("SELECT changes();").fetchone()[0]
 
     # 3) Update CHANGED rows (row_hash differs): overwrite measures, bump revision_count, mark revised.
-    #    We also update last_ingested_at and last_run_id.
     conn.execute("""
-    UPDATE cur_daily_prices
+    UPDATE cur_daily_prices AS c
     SET
-      open = (
-        SELECT s.open FROM stg_daily_prices s
+      (open, high, low, close, volume, row_hash, last_ingested_at, last_run_id) = (
+        SELECT
+          s.open, s.high, s.low, s.close, s.volume, s.row_hash, s.ingested_at, s.run_id
+        FROM stg_daily_prices AS s
         WHERE s.run_id = ?
-          AND s.provider = cur_daily_prices.provider
-          AND s.provider_symbol = cur_daily_prices.provider_symbol
-          AND s.trading_date = cur_daily_prices.trading_date
-      ),
-      high = (
-        SELECT s.high FROM stg_daily_prices s
-        WHERE s.run_id = ?
-          AND s.provider = cur_daily_prices.provider
-          AND s.provider_symbol = cur_daily_prices.provider_symbol
-          AND s.trading_date = cur_daily_prices.trading_date
-      ),
-      low = (
-        SELECT s.low FROM stg_daily_prices s
-        WHERE s.run_id = ?
-          AND s.provider = cur_daily_prices.provider
-          AND s.provider_symbol = cur_daily_prices.provider_symbol
-          AND s.trading_date = cur_daily_prices.trading_date
-      ),
-      close = (
-        SELECT s.close FROM stg_daily_prices s
-        WHERE s.run_id = ?
-          AND s.provider = cur_daily_prices.provider
-          AND s.provider_symbol = cur_daily_prices.provider_symbol
-          AND s.trading_date = cur_daily_prices.trading_date
-      ),
-      volume = (
-        SELECT s.volume FROM stg_daily_prices s
-        WHERE s.run_id = ?
-          AND s.provider = cur_daily_prices.provider
-          AND s.provider_symbol = cur_daily_prices.provider_symbol
-          AND s.trading_date = cur_daily_prices.trading_date
-      ),
-      row_hash = (
-        SELECT s.row_hash FROM stg_daily_prices s
-        WHERE s.run_id = ?
-          AND s.provider = cur_daily_prices.provider
-          AND s.provider_symbol = cur_daily_prices.provider_symbol
-          AND s.trading_date = cur_daily_prices.trading_date
-      ),
-      last_ingested_at = (
-        SELECT s.ingested_at FROM stg_daily_prices s
-        WHERE s.run_id = ?
-          AND s.provider = cur_daily_prices.provider
-          AND s.provider_symbol = cur_daily_prices.provider_symbol
-          AND s.trading_date = cur_daily_prices.trading_date
-      ),
-      last_run_id = (
-        SELECT s.run_id FROM stg_daily_prices s
-        WHERE s.run_id = ?
-          AND s.provider = cur_daily_prices.provider
-          AND s.provider_symbol = cur_daily_prices.provider_symbol
-          AND s.trading_date = cur_daily_prices.trading_date
+          AND s.provider_symbol = ?
+          AND s.provider = c.provider
+          AND s.trading_date = c.trading_date
       ),
       revision_count = revision_count + 1,
       is_revised = 1
-    WHERE EXISTS (
-      SELECT 1
-      FROM stg_daily_prices s
-      WHERE s.run_id = ?
-        AND s.provider = cur_daily_prices.provider
-        AND s.provider_symbol = cur_daily_prices.provider_symbol
-        AND s.trading_date = cur_daily_prices.trading_date
-        AND s.row_hash <> cur_daily_prices.row_hash
-    );
-    """, (run_id, run_id, run_id, run_id, run_id, run_id, run_id, run_id, run_id))
+    WHERE c.provider_symbol = ?
+      AND EXISTS (
+        SELECT 1
+        FROM stg_daily_prices AS s
+        WHERE s.run_id = ?
+          AND s.provider_symbol = ?
+          AND s.provider = c.provider
+          AND s.trading_date = c.trading_date
+          AND s.row_hash <> c.row_hash
+      );
+    """, (run_id, provider_symbol, provider_symbol, run_id, provider_symbol))
     updated = conn.execute("SELECT changes();").fetchone()[0]
 
     # 4) Update UNCHANGED rows: same hash, so refresh only metadata (last_ingested_at, last_run_id).
     conn.execute("""
-    UPDATE cur_daily_prices
+    UPDATE cur_daily_prices AS c
     SET
-      last_ingested_at = (
-        SELECT s.ingested_at FROM stg_daily_prices s
+      (last_ingested_at, last_run_id) = (
+        SELECT
+          s.ingested_at, s.run_id
+        FROM stg_daily_prices AS s
         WHERE s.run_id = ?
-          AND s.provider = cur_daily_prices.provider
-          AND s.provider_symbol = cur_daily_prices.provider_symbol
-          AND s.trading_date = cur_daily_prices.trading_date
-      ),
-      last_run_id = (
-        SELECT s.run_id FROM stg_daily_prices s
-        WHERE s.run_id = ?
-          AND s.provider = cur_daily_prices.provider
-          AND s.provider_symbol = cur_daily_prices.provider_symbol
-          AND s.trading_date = cur_daily_prices.trading_date
+          AND s.provider_symbol = ?
+          AND s.provider = c.provider
+          AND s.trading_date = c.trading_date
       )
-    WHERE EXISTS (
-      SELECT 1
-      FROM stg_daily_prices s
-      WHERE s.run_id = ?
-        AND s.provider = cur_daily_prices.provider
-        AND s.provider_symbol = cur_daily_prices.provider_symbol
-        AND s.trading_date = cur_daily_prices.trading_date
-        AND s.row_hash = cur_daily_prices.row_hash
-    );
-    """, (run_id, run_id, run_id))
+    WHERE c.provider_symbol = ?
+      AND EXISTS (
+        SELECT 1
+        FROM stg_daily_prices AS s
+        WHERE s.run_id = ?
+          AND s.provider_symbol = ?
+          AND s.provider = c.provider
+          AND s.trading_date = c.trading_date
+          AND s.row_hash = c.row_hash
+      );
+    """, (run_id, provider_symbol, provider_symbol, run_id, provider_symbol))
     unchanged = conn.execute("SELECT changes();").fetchone()[0]
 
     conn.commit()
@@ -496,11 +490,8 @@ def mark_removed_watchlist(conn: sqlite3.Connection, provider: str, provider_sym
       WHERE provider = ? AND provider_symbol = ?;
     """, (removed_at, provider, provider_symbol))
 
-def run_one_symbol(conn: sqlite3.Connection, provider_symbol: str, run_id: str) -> None:
-    # 1) Extract latest CSV for this symbol
-    csv_path = extract_stooq_csv(provider_symbol)
-    
-    # 2) Determine incremental window from watermark
+def run_one_symbol(conn: sqlite3.Connection, provider_symbol: str, run_id: str, force_download: bool = False, verbose: bool = False) -> None:
+    # 0) Determine incremental window first (so it is logged even if download fails)
     last_success = get_last_success_date(conn, PROVIDER, provider_symbol)
     if last_success is None:
         date_from = "1900-01-01"
@@ -508,60 +499,109 @@ def run_one_symbol(conn: sqlite3.Connection, provider_symbol: str, run_id: str) 
         date_from = iso_yyyy_mm_dd(parse_yyyy_mm_dd(last_success) - timedelta(days=SAFETY_DAYS))
     date_to = iso_yyyy_mm_dd(datetime.now(timezone.utc).date())
 
-    print(f"\n=== {provider_symbol} window: {date_from} to {date_to} ===")
-
-    # 3) Run pipeline steps for this symbol
-    raw_count = load_csv_to_raw(conn, csv_path, provider_symbol, run_id, date_from, date_to)
-    stg_count = rebuild_staging_for_run(conn, run_id)  # staging is run-scoped in your design
-    ins, upd, same = merge_stg_to_curated(conn, run_id)
-
-    # 4) Update watermark on success
-    max_date = conn.execute("""
-        SELECT MAX(trading_date)
-        FROM cur_daily_prices
-        WHERE provider = ? AND provider_symbol = ?;
-    """, (PROVIDER, provider_symbol)).fetchone()[0]
-
-    upsert_watermark_success(conn, PROVIDER, provider_symbol, max_date, run_id, utc_now_iso())
+    sym_started_at = utc_now_iso()
+    insert_symbol_start(conn, run_id, PROVIDER, provider_symbol, date_from, date_to, sym_started_at)
     conn.commit()
 
-    print("curated inserted:", ins)
-    print("curated updated (revised):", upd)
-    print("curated unchanged (metadata refreshed):", same)
+    raw_count = stg_count = ins = upd = same = 0
+    try:
+        # 1) Extract latest CSV for this symbol
+        csv_path = extract_stooq_csv(provider_symbol, force=force_download)
 
-    cur_cnt = conn.execute("SELECT COUNT(*) FROM cur_daily_prices;").fetchone()[0]
-    print("curated total rows:", cur_cnt)
-    print("run_id:", run_id)
-    print("raw rows for this run+symbol:", raw_count)
-    print("stg rows for this run:", stg_count)
+        print(f"\n=== {provider_symbol} window: {date_from} to {date_to} ===")
 
-    rev_cnt_run = conn.execute("""
-        SELECT COUNT(*)
-        FROM cur_daily_prices
-        WHERE provider = ? AND provider_symbol = ? AND is_revised = 1 AND last_run_id = ?;
-    """, (PROVIDER, provider_symbol, run_id)).fetchone()[0]
-    print("curated revised rows (this run):", rev_cnt_run)
+        # 2) Run pipeline steps for this symbol
+        raw_count = load_csv_to_raw(conn, csv_path, provider_symbol, run_id, date_from, date_to)
+        stg_count = rebuild_staging_for_run_symbol(conn, run_id, provider_symbol)  # staging is symbol-scoped
+        ins, upd, same = merge_stg_to_curated(conn, run_id, provider_symbol)
 
-    # Show a couple sample rows
-    print("\nRAW sample:")
-    for r in conn.execute("""
-        SELECT provider_symbol, trading_date, open, close, volume, ingested_at, run_id, row_hash
-        FROM raw_stooq_daily_prices
-        WHERE run_id = ? AND provider_symbol = ?
-        ORDER BY trading_date ASC
-        LIMIT 2;
-    """, (run_id, provider_symbol)):
-        print(r)
+        # 3) Update watermark on success
+        max_date = conn.execute("""
+            SELECT MAX(trading_date)
+            FROM cur_daily_prices
+            WHERE provider = ? AND provider_symbol = ?;
+        """, (PROVIDER, provider_symbol)).fetchone()[0]
 
-    print("\nSTG sample:")
-    for r in conn.execute("""
-        SELECT provider_symbol, trading_date, open, close, volume, raw_row_count, raw_max_ingested_at
-        FROM stg_daily_prices
-        WHERE run_id = ? AND provider_symbol = ?
-        ORDER BY trading_date ASC
-        LIMIT 2;
-    """, (run_id, provider_symbol)):
-        print(r)
+        upsert_watermark_success(conn, PROVIDER, provider_symbol, max_date, run_id, utc_now_iso())
+
+        # 4) Finalize symbol log (success)
+        finalize_symbol(
+            conn,
+            run_id=run_id,
+            provider=PROVIDER,
+            provider_symbol=provider_symbol,
+            ended_at=utc_now_iso(),
+            status="success",
+            date_from=date_from,
+            date_to=date_to,
+            raw_count=raw_count,
+            stg_count=stg_count,
+            ins=ins,
+            upd=upd,
+            same=same,
+            error_message=None
+        )
+        conn.commit()
+
+        # ---- your existing prints + samples (unchanged) ----
+        print("curated inserted:", ins)
+        print("curated updated (revised):", upd)
+        print("curated unchanged (metadata refreshed):", same)
+
+        cur_cnt = conn.execute("SELECT COUNT(*) FROM cur_daily_prices;").fetchone()[0]
+        print("curated total rows:", cur_cnt)
+        print("run_id:", run_id)
+        print("raw rows for this run+symbol:", raw_count)
+        print("stg rows for this run:", stg_count)
+
+        rev_cnt_run = conn.execute("""
+            SELECT COUNT(*)
+            FROM cur_daily_prices
+            WHERE provider = ? AND provider_symbol = ? AND is_revised = 1 AND last_run_id = ?;
+        """, (PROVIDER, provider_symbol, run_id)).fetchone()[0]
+        print("curated revised rows (this run):", rev_cnt_run)
+
+        if verbose:
+            print("\nRAW sample:")
+            for r in conn.execute("""
+                SELECT provider_symbol, trading_date, open, close, volume, ingested_at, run_id, row_hash
+                FROM raw_stooq_daily_prices
+                WHERE run_id = ? AND provider_symbol = ?
+                ORDER BY trading_date ASC
+                LIMIT 2;
+            """, (run_id, provider_symbol)):
+                print(r)
+    
+            print("\nSTG sample:")
+            for r in conn.execute("""
+                SELECT provider_symbol, trading_date, open, close, volume, raw_row_count, raw_max_ingested_at
+                FROM stg_daily_prices
+                WHERE run_id = ? AND provider_symbol = ?
+                ORDER BY trading_date ASC
+                LIMIT 2;
+            """, (run_id, provider_symbol)):
+                print(r)
+
+    except Exception as e:
+        # Finalize symbol log (failed) — keep counts 0 because we may fail before load starts
+        finalize_symbol(
+            conn,
+            run_id=run_id,
+            provider=PROVIDER,
+            provider_symbol=provider_symbol,
+            ended_at=utc_now_iso(),
+            status="failed",
+            date_from=date_from,
+            date_to=date_to,
+            raw_count=raw_count,
+            stg_count=stg_count,
+            ins=ins,
+            upd=upd,
+            same=same,
+            error_message=str(e)
+        )
+        conn.commit()
+        raise
 
 
 def seed_watchlist_if_empty(conn: sqlite3.Connection) -> None:
@@ -611,7 +651,7 @@ def stooq_daily_csv_url(provider_symbol: str) -> str:
     return f"https://stooq.com/q/d/l/?s={s}&i=d"
 
 
-def extract_stooq_csv(provider_symbol: str) -> str:
+def extract_stooq_csv(provider_symbol: str, force: bool = False) -> str:
     """
     Downloads the daily CSV for provider_symbol into data/ and returns the local path.
     Uses a cache check + atomic write to avoid partial/corrupt files.
@@ -624,7 +664,7 @@ def extract_stooq_csv(provider_symbol: str) -> str:
     out_p = Path(out_path)
 
     # 1) Cache: if we already have a non-trivial file, reuse it
-    if out_p.exists() and out_p.stat().st_size > 100:
+    if (not force) and out_p.exists() and out_p.stat().st_size > 100:
         print(f"cached: {provider_symbol} -> {out_path}")
         return out_path
 
@@ -659,7 +699,82 @@ def extract_stooq_csv(provider_symbol: str) -> str:
     except urllib.error.URLError as e:
         raise RuntimeError(f"Network error downloading {provider_symbol}: {e.reason}") from e
 
-def main():
+def insert_run_start(conn: sqlite3.Connection, run_id: str, started_at: str, symbols_total: int) -> None:
+    conn.execute("""
+        INSERT INTO run_log (run_id, started_at, ended_at, status, symbols_total, symbols_success, symbols_failed)
+        VALUES (?, ?, NULL, 'partial', ?, 0, 0)
+        ON CONFLICT(run_id) DO NOTHING;
+    """, (run_id, started_at, symbols_total))
+
+
+def finalize_run(conn: sqlite3.Connection, run_id: str, ended_at: str, symbols_success: int, symbols_failed: int) -> None:
+    status = "success" if symbols_failed == 0 else ("failed" if symbols_success == 0 else "partial")
+    conn.execute("""
+        UPDATE run_log
+        SET ended_at = ?,
+            status = ?,
+            symbols_success = ?,
+            symbols_failed = ?
+        WHERE run_id = ?;
+    """, (ended_at, status, symbols_success, symbols_failed, run_id))
+
+
+def insert_symbol_start(
+    conn: sqlite3.Connection,
+    run_id: str,
+    provider: str,
+    provider_symbol: str,
+    date_from: str,
+    date_to: str,
+    started_at: str
+) -> None:
+    conn.execute("""
+        INSERT INTO run_symbol_log (
+            run_id, provider, provider_symbol,
+            status, date_from, date_to,
+            raw_count, stg_count, ins, upd, same,
+            error_message, started_at, ended_at
+        ) VALUES (?, ?, ?, 'partial', ?, ?, 0, 0, 0, 0, 0, NULL, ?, NULL)
+        ON CONFLICT(run_id, provider, provider_symbol) DO NOTHING;
+    """, (run_id, provider, provider_symbol, date_from, date_to, started_at))
+
+
+def finalize_symbol(
+    conn: sqlite3.Connection,
+    run_id: str,
+    provider: str,
+    provider_symbol: str,
+    ended_at: str,
+    status: str,
+    date_from: str,
+    date_to: str,
+    raw_count: int,
+    stg_count: int,
+    ins: int,
+    upd: int,
+    same: int,
+    error_message: str | None
+) -> None:
+    conn.execute("""
+        UPDATE run_symbol_log
+        SET ended_at = ?,
+            status = ?,
+            date_from = ?,
+            date_to = ?,
+            raw_count = ?,
+            stg_count = ?,
+            ins = ?,
+            upd = ?,
+            same = ?,
+            error_message = ?
+        WHERE run_id = ? AND provider = ? AND provider_symbol = ?;
+    """, (
+        ended_at, status, date_from, date_to,
+        raw_count, stg_count, ins, upd, same, error_message,
+        run_id, provider, provider_symbol
+    ))
+
+def main(force_download: bool = False, verbose: bool = False):
     run_id = make_run_id()
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -671,21 +786,36 @@ def main():
         if not symbols:
             raise ValueError("No active symbols in watchlist_symbols.")
 
+        run_started_at = utc_now_iso()
+        insert_run_start(conn, run_id, run_started_at, symbols_total=len(symbols))
+        conn.commit()
+
+        symbols_success = 0
+        symbols_failed = 0
+        
         for sym in symbols:
             try:
-                run_one_symbol(conn, sym, run_id)
+                run_one_symbol(conn, sym, run_id, force_download=force_download, verbose=verbose)
+                symbols_success += 1
             except Exception as e:
                 upsert_watermark_failed(conn, PROVIDER, sym, run_id, utc_now_iso())
                 conn.commit()
+                symbols_failed += 1
                 print(f"!!! FAILED symbol {sym}: {e}")
                 #keep going for other symbols
                 continue
-                
+        
+        finalize_run(conn, run_id, utc_now_iso(), symbols_success, symbols_failed)
+        conn.commit()
+        
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--add-symbol")
     parser.add_argument("--remove-symbol")
+    parser.add_argument("--refresh", action="store_true")
+    parser.add_argument("--verbose", action="store_true")
+    
     args = parser.parse_args()
 
     if args.add_symbol:
@@ -700,4 +830,4 @@ if __name__ == "__main__":
             conn.commit()
         print(f"Removed/deactivated {args.remove_symbol}")
     else:
-        main()
+        main(force_download=args.refresh, verbose=args.verbose)
