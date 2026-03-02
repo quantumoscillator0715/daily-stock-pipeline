@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import urllib.request
 import urllib.error
+import math
 
 from datetime import datetime, timezone, date, timedelta  # add date, timedelta
 
@@ -181,8 +182,158 @@ def init_db(conn: sqlite3.Connection) -> None:
       CHECK (status IN ('success', 'failed', 'partial'))
     );
     """)
-      
-      
+
+    conn.executescript("""
+    DROP VIEW IF EXISTS vw_latest_close;
+
+    CREATE VIEW vw_latest_close AS
+    SELECT
+      c.provider,
+      c.provider_symbol,
+      c.trading_date AS latest_date,
+      c.close AS latest_close,
+      c.volume AS latest_volume,
+      c.last_ingested_at,
+      c.last_run_id
+    FROM cur_daily_prices c
+    JOIN (
+      SELECT provider, provider_symbol, MAX(trading_date) AS max_date
+      FROM cur_daily_prices
+      GROUP BY provider, provider_symbol
+    ) m
+      ON c.provider = m.provider
+     AND c.provider_symbol = m.provider_symbol
+     AND c.trading_date = m.max_date;
+    """)
+
+    conn.executescript("""
+    DROP VIEW IF EXISTS vw_daily_returns;
+    
+    CREATE VIEW vw_daily_returns AS
+    SELECT
+      provider,
+      provider_symbol,
+      trading_date,
+      close,
+      LAG(close) OVER (PARTITION BY provider, provider_symbol ORDER BY trading_date) AS prev_close,
+      CASE
+        WHEN LAG(close) OVER (PARTITION BY provider, provider_symbol ORDER BY trading_date) IS NULL THEN NULL
+        WHEN LAG(close) OVER (PARTITION BY provider, provider_symbol ORDER BY trading_date) = 0 THEN NULL
+        ELSE (close / LAG(close) OVER (PARTITION BY provider, provider_symbol ORDER BY trading_date)) - 1
+      END AS daily_return
+    FROM cur_daily_prices;
+    """)
+
+
+    conn.executescript("""
+    DROP VIEW IF EXISTS vw_tech_indicators;
+
+    CREATE VIEW vw_tech_indicators AS
+    WITH base AS (
+      SELECT
+        provider,
+        provider_symbol,
+        trading_date,
+        close,
+        daily_return
+      FROM vw_daily_returns
+    ),
+    w AS (
+      SELECT
+        provider,
+        provider_symbol,
+        trading_date,
+        close,
+        daily_return,
+    
+        AVG(close) OVER (
+          PARTITION BY provider, provider_symbol
+          ORDER BY trading_date
+          ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+        ) AS sma_20,
+    
+        AVG(close) OVER (
+          PARTITION BY provider, provider_symbol
+          ORDER BY trading_date
+          ROWS BETWEEN 49 PRECEDING AND CURRENT ROW
+        ) AS sma_50,
+    
+        COUNT(daily_return) OVER (
+          PARTITION BY provider, provider_symbol
+          ORDER BY trading_date
+          ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+        ) AS n_ret_20,
+    
+        AVG(daily_return) OVER (
+          PARTITION BY provider, provider_symbol
+          ORDER BY trading_date
+          ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+        ) AS mean_ret_20,
+    
+        AVG(daily_return * daily_return) OVER (
+          PARTITION BY provider, provider_symbol
+          ORDER BY trading_date
+          ROWS BETWEEN 19 PRECEDING AND CURRENT ROW
+        ) AS mean_ret2_20
+      FROM base
+    ),
+    final AS (
+      SELECT
+        provider,
+        provider_symbol,
+        trading_date,
+        close,
+        daily_return,
+        sma_20,
+        sma_50,
+        CASE
+          WHEN n_ret_20 < 20 THEN NULL
+          ELSE (mean_ret2_20 - mean_ret_20 * mean_ret_20)
+        END AS var_20d
+      FROM w
+    )
+    SELECT
+      provider,
+      provider_symbol,
+      trading_date,
+      close,
+      daily_return,
+      sma_20,
+      sma_50,
+      var_20d
+    FROM final;
+    """)
+
+    conn.executescript("""
+    DROP VIEW IF EXISTS vw_watchlist_report;
+    
+    CREATE VIEW vw_watchlist_report AS
+    SELECT
+      t.provider,
+      t.provider_symbol,
+      t.trading_date AS latest_date,
+      t.close AS latest_close,
+      t.daily_return,
+      t.sma_20,
+      t.sma_50,
+      t.var_20d
+    FROM vw_tech_indicators t
+    JOIN (
+      SELECT provider, provider_symbol, MAX(trading_date) AS max_date
+      FROM vw_tech_indicators
+      GROUP BY provider, provider_symbol
+    ) m
+      ON t.provider = m.provider
+     AND t.provider_symbol = m.provider_symbol
+     AND t.trading_date = m.max_date
+    WHERE EXISTS (
+      SELECT 1
+      FROM watchlist_symbols w
+      WHERE w.provider = t.provider
+        AND w.provider_symbol = t.provider_symbol
+        AND w.is_active = 1
+    );
+    """)
     
     conn.commit()
 
@@ -815,6 +966,7 @@ if __name__ == "__main__":
     parser.add_argument("--remove-symbol")
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--report", action="store_true")
     
     args = parser.parse_args()
 
@@ -829,5 +981,43 @@ if __name__ == "__main__":
             mark_removed_watchlist(conn, PROVIDER, args.remove_symbol, utc_now_iso())
             conn.commit()
         print(f"Removed/deactivated {args.remove_symbol}")
+    elif args.report:
+        with sqlite3.connect(DB_PATH) as conn:
+            init_db(conn)  # ensures views exist
+
+            rows = conn.execute("""
+                SELECT provider_symbol, latest_date, latest_close, daily_return, sma_20, sma_50, var_20d
+                FROM vw_watchlist_report
+                ORDER BY provider_symbol;
+            """).fetchall()
+            
+        print("\n=== Watchlist Report ===")
+        print("symbol | date | close | ret% | sma20 | sma50 | vol20%")
+        
+        for sym, dt, close, ret, sma20, sma50, var20 in rows:
+            vol20 = None
+            if var20 is not None and var20 > 0:
+                vol20 = math.sqrt(var20)
+
+            ret_pct = None if ret is None else ret * 100.0
+            vol_pct = None if vol20 is None else vol20 * 100.0
+
+            # format nicely; keep blanks for None
+            def fmt(x, nd=2):
+                if x is None:
+                    return ""
+                if isinstance(x, (int, float)):
+                    return f"{x:.{nd}f}"
+                return str(x)
+        
+            print(" | ".join([
+                sym,
+                dt,
+                fmt(close, 2),
+                fmt(ret_pct, 2),
+                fmt(sma20, 2),
+                fmt(sma50, 2),
+                fmt(vol_pct, 2),
+            ]))
     else:
         main(force_download=args.refresh, verbose=args.verbose)
