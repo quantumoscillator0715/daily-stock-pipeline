@@ -1,16 +1,12 @@
-import csv
-import hashlib
 import sqlite3
 import argparse
-from pathlib import Path
-import urllib.request
-import urllib.error
 import math
 from datetime import datetime, timezone, date, timedelta
 
 from daily_stock.util import utc_now_iso, make_run_id, compute_row_hash, parse_yyyy_mm_dd, iso_yyyy_mm_dd
 from daily_stock.extract import extract_stooq_csv
 from daily_stock.db import init_db
+from daily_stock.load import load_csv_to_raw
 
 #constants
 SAFETY_DAYS = 10
@@ -19,73 +15,7 @@ PROVIDER = "stooq"
 DATA_DIR = Path("data")
 
 
-def load_csv_to_raw(conn: sqlite3.Connection, csv_path: str, provider_symbol: str, run_id: str, date_from: str, date_to: str) -> int:
-    """
-    Read the Stooq CSV and append rows into RAW.
-    Returns number of inserted rows.
-    """
-    ingested_at = utc_now_iso()
 
-    # You can store the exact URL you used. For manual download, store a descriptive placeholder.
-    source_url = f"manual_file://{Path(csv_path).name}"
-
-    with open(csv_path, "r", newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        
-        date_from_d = parse_yyyy_mm_dd(date_from)
-        date_to_d   = parse_yyyy_mm_dd(date_to)
-        
-        # Contract check: header must be exactly these fieldnames in this order
-        expected = ["Date", "Open", "High", "Low", "Close", "Volume"]
-        if reader.fieldnames != expected:
-            raise ValueError(f"Bad header. Expected {expected} but got {reader.fieldnames}")
-
-        for row in reader:
-            trading_date = row["Date"]
-            trading_date_d = parse_yyyy_mm_dd(trading_date)
-            if trading_date_d < date_from_d or trading_date_d > date_to_d:
-                continue
-            open_s = row["Open"]
-            high_s = row["High"]
-            low_s = row["Low"]
-            close_s = row["Close"]
-            volume_s = row["Volume"]
-
-            row_hash = compute_row_hash(
-                PROVIDER,
-                provider_symbol=provider_symbol,
-                trading_date=trading_date,
-                open_s=open_s,
-                high_s=high_s,
-                low_s=low_s,
-                close_s=close_s,
-                volume_s=volume_s
-            )
-
-            # Insert into RAW. If you rerun with same run_id, UNIQUE constraint will protect you.
-            conn.execute("""
-                INSERT OR IGNORE INTO raw_stooq_daily_prices (
-                    provider, provider_symbol, trading_date,
-                    open, high, low, close, volume,
-                    source_url, ingested_at, run_id, row_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
-            """, (
-                PROVIDER, provider_symbol, trading_date,
-                float(open_s), float(high_s), float(low_s), float(close_s), float(volume_s),
-                source_url, ingested_at, run_id, row_hash
-            ))
-
-
-    conn.commit()
-
-    # conn.total_changes is cumulative, so the above is not ideal.
-    # Instead, compute inserted rows by querying counts for this run:
-    cur = conn.execute("""
-        SELECT COUNT(*)
-        FROM raw_stooq_daily_prices
-        WHERE run_id = ? AND provider_symbol = ?;
-    """, (run_id, provider_symbol))
-    return cur.fetchone()[0]
 
 
 def rebuild_staging_for_run_symbol(conn: sqlite3.Connection, run_id: str, provider_symbol: str) -> int:
@@ -142,8 +72,6 @@ def rebuild_staging_for_run_symbol(conn: sqlite3.Connection, run_id: str, provid
       AND r.provider = ?
       AND r.provider_symbol = ?;
     """, (stg_ingested_at, run_id, PROVIDER, provider_symbol, run_id, PROVIDER, provider_symbol))
-
-    conn.commit()
 
     cur = conn.execute("""
         SELECT COUNT(*)
@@ -268,7 +196,6 @@ def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str, provider_symbol:
     ))
     unchanged = conn.execute("SELECT changes();").fetchone()[0]
 
-    conn.commit()
     return inserted, updated, unchanged
 
 
@@ -452,7 +379,6 @@ def seed_watchlist_if_empty(conn: sqlite3.Connection) -> None:
             INSERT INTO watchlist_symbols (provider, provider_symbol, is_active, added_at, notes)
             VALUES (?, ?, 1, ?, ?);
         """, (PROVIDER, "AAPL.US", utc_now_iso(), "seed symbol"))
-        conn.commit()
         print("Seeded watchlist with AAPL.US")
 
 def upsert_watchlist_symbol(conn: sqlite3.Connection, provider: str, provider_symbol: str, notes: str = "") -> None:
@@ -465,7 +391,7 @@ def upsert_watchlist_symbol(conn: sqlite3.Connection, provider: str, provider_sy
             removed_at = NULL,
             notes = CASE WHEN excluded.notes != '' THEN excluded.notes ELSE watchlist_symbols.notes END;
     """, (provider, provider_symbol, now, notes))
-    conn.commit()
+
 
 
 
