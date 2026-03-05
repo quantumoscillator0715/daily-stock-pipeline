@@ -2,41 +2,18 @@ import csv
 import hashlib
 import sqlite3
 import argparse
-from datetime import datetime, timezone
 from pathlib import Path
 import urllib.request
 import urllib.error
 import math
-
-from datetime import datetime, timezone, date, timedelta  # add date, timedelta
+from datetime import datetime, timezone, date, timedelta
+from daily_stock.util import 
 
 #constants
 SAFETY_DAYS = 10
 DB_PATH = "stock.db"
 PROVIDER = "stooq"
 DATA_DIR = Path("data")
-
-
-def utc_now_iso() -> str:
-    """Return current UTC time as ISO string like 2026-02-07T03:45:01Z."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
-def make_run_id(pipeline_name: str = "stock_daily", env: str = "dev") -> str:
-    """Create a sortable run_id."""
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    return f"{ts}_{pipeline_name}_{env}"
-
-
-def compute_row_hash(provider_symbol: str, trading_date: str,
-                     open_s: str, high_s: str, low_s: str, close_s: str, volume_s: str) -> str:
-    """
-    Hash the canonical string:
-    provider_symbol|trading_date|open|high|low|close|volume
-    using sha256.
-    """
-    canonical = f"{provider_symbol}|{trading_date}|{open_s}|{high_s}|{low_s}|{close_s}|{volume_s}"
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def init_db(conn: sqlite3.Connection) -> None:
@@ -348,8 +325,6 @@ def load_csv_to_raw(conn: sqlite3.Connection, csv_path: str, provider_symbol: st
     # You can store the exact URL you used. For manual download, store a descriptive placeholder.
     source_url = f"manual_file://{Path(csv_path).name}"
 
-    inserted = 0
-
     with open(csv_path, "r", newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         
@@ -373,6 +348,7 @@ def load_csv_to_raw(conn: sqlite3.Connection, csv_path: str, provider_symbol: st
             volume_s = row["Volume"]
 
             row_hash = compute_row_hash(
+                PROVIDER,
                 provider_symbol=provider_symbol,
                 trading_date=trading_date,
                 open_s=open_s,
@@ -395,8 +371,6 @@ def load_csv_to_raw(conn: sqlite3.Connection, csv_path: str, provider_symbol: st
                 source_url, ingested_at, run_id, row_hash
             ))
 
-            # sqlite3 doesn't directly tell "ignored vs inserted" unless we check changes()
-            inserted += conn.total_changes  # we'll fix this below
 
     conn.commit()
 
@@ -476,22 +450,24 @@ def rebuild_staging_for_run_symbol(conn: sqlite3.Connection, run_id: str, provid
 
 def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str, provider_symbol: str) -> tuple[int, int, int]:
     """
-    Merge STG rows for a given run_id into CUR (latest-state table).
+    Merge STG rows for one (provider, provider_symbol) and one run_id into CUR.
 
     Returns: (inserted_rows, updated_rows, unchanged_rows)
-      - inserted_rows: new (provider, provider_symbol, trading_date)
-      - updated_rows: existing key but row_hash changed -> revise + overwrite OHLCV
-      - unchanged_rows: existing key and row_hash same -> only refresh last_ingested_at/last_run_id
     """
 
-    # 1) Safety check per symbol
-    cur = conn.execute("SELECT COUNT(*) FROM stg_daily_prices WHERE run_id = ? AND provider_symbol = ?;", (run_id, provider_symbol))
+    provider = PROVIDER  # keep it explicit for clarity
+
+    # 1) Safety check per provider+symbol
+    cur = conn.execute("""
+        SELECT COUNT(*)
+        FROM stg_daily_prices
+        WHERE run_id = ? AND provider = ? AND provider_symbol = ?;
+    """, (run_id, provider, provider_symbol))
     stg_count = cur.fetchone()[0]
     if stg_count == 0:
-        raise ValueError(f"No staging rows found for run_id={run_id}. Did you rebuild staging?")
+        raise ValueError(f"No staging rows found for provider={provider} symbol={provider_symbol} run_id={run_id}")
 
-    # 2) Insert NEW keys into curated (first time we see that (symbol, date)).
-    #    We set first_ingested_at = stg.ingested_at for brand-new rows.
+    # 2) INSERT brand-new keys into curated
     conn.execute("""
     INSERT INTO cur_daily_prices (
       provider, provider_symbol, trading_date,
@@ -506,6 +482,7 @@ def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str, provider_symbol:
       0, 0
     FROM stg_daily_prices s
     WHERE s.run_id = ?
+      AND s.provider = ?
       AND s.provider_symbol = ?
       AND NOT EXISTS (
         SELECT 1
@@ -514,10 +491,10 @@ def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str, provider_symbol:
           AND c.provider_symbol = s.provider_symbol
           AND c.trading_date = s.trading_date
       );
-    """, (run_id, provider_symbol))
+    """, (run_id, provider, provider_symbol))
     inserted = conn.execute("SELECT changes();").fetchone()[0]
 
-    # 3) Update CHANGED rows (row_hash differs): overwrite measures, bump revision_count, mark revised.
+    # 3) UPDATE changed rows (hash differs): overwrite measures, bump revision_count, mark revised
     conn.execute("""
     UPDATE cur_daily_prices AS c
     SET
@@ -526,26 +503,34 @@ def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str, provider_symbol:
           s.open, s.high, s.low, s.close, s.volume, s.row_hash, s.ingested_at, s.run_id
         FROM stg_daily_prices AS s
         WHERE s.run_id = ?
+          AND s.provider = ?
           AND s.provider_symbol = ?
           AND s.provider = c.provider
           AND s.trading_date = c.trading_date
+          AND s.row_hash <> c.row_hash
       ),
       revision_count = revision_count + 1,
       is_revised = 1
-    WHERE c.provider_symbol = ?
+    WHERE c.provider = ?
+      AND c.provider_symbol = ?
       AND EXISTS (
         SELECT 1
         FROM stg_daily_prices AS s
         WHERE s.run_id = ?
+          AND s.provider = ?
           AND s.provider_symbol = ?
           AND s.provider = c.provider
           AND s.trading_date = c.trading_date
           AND s.row_hash <> c.row_hash
       );
-    """, (run_id, provider_symbol, provider_symbol, run_id, provider_symbol))
+    """, (
+        run_id, provider, provider_symbol,          # subquery params
+        provider, provider_symbol,                  # outer row filter
+        run_id, provider, provider_symbol           # EXISTS params
+    ))
     updated = conn.execute("SELECT changes();").fetchone()[0]
 
-    # 4) Update UNCHANGED rows: same hash, so refresh only metadata (last_ingested_at, last_run_id).
+    # 4) UPDATE unchanged rows (hash same): refresh only metadata
     conn.execute("""
     UPDATE cur_daily_prices AS c
     SET
@@ -554,34 +539,34 @@ def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str, provider_symbol:
           s.ingested_at, s.run_id
         FROM stg_daily_prices AS s
         WHERE s.run_id = ?
+          AND s.provider = ?
           AND s.provider_symbol = ?
           AND s.provider = c.provider
           AND s.trading_date = c.trading_date
+          AND s.row_hash = c.row_hash
       )
-    WHERE c.provider_symbol = ?
+    WHERE c.provider = ?
+      AND c.provider_symbol = ?
       AND EXISTS (
         SELECT 1
         FROM stg_daily_prices AS s
         WHERE s.run_id = ?
+          AND s.provider = ?
           AND s.provider_symbol = ?
           AND s.provider = c.provider
           AND s.trading_date = c.trading_date
           AND s.row_hash = c.row_hash
       );
-    """, (run_id, provider_symbol, provider_symbol, run_id, provider_symbol))
+    """, (
+        run_id, provider, provider_symbol,          # subquery params
+        provider, provider_symbol,                  # outer row filter
+        run_id, provider, provider_symbol           # EXISTS params
+    ))
     unchanged = conn.execute("SELECT changes();").fetchone()[0]
 
     conn.commit()
     return inserted, updated, unchanged
 
-def parse_yyyy_mm_dd(s: str) -> date:
-    """Parse ISO date string YYYY-MM-DD into a date object."""
-    return datetime.strptime(s, "%Y-%m-%d").date()
-
-
-def iso_yyyy_mm_dd(d: date) -> str:
-    """Convert a date object into YYYY-MM-DD string."""
-    return d.strftime("%Y-%m-%d")
 
 
 def get_last_success_date(conn: sqlite3.Connection, provider: str, provider_symbol: str) -> str | None:
@@ -778,77 +763,7 @@ def upsert_watchlist_symbol(conn: sqlite3.Connection, provider: str, provider_sy
     """, (provider, provider_symbol, now, notes))
     conn.commit()
 
-def stooq_symbol_for_url(provider_symbol: str) -> str:
-    """
-    Stooq expects lowercase symbols in the URL, e.g. 'AAPL.US' -> 'aapl.us'
-    """
-    return provider_symbol.strip().lower()
 
-
-def csv_path_for_symbol(provider_symbol: str) -> str:
-    """
-    Your file naming convention: 'AAPL.US' -> 'data/aapl_us_d.csv'
-    """
-    safe = provider_symbol.strip().lower().replace(".", "_")
-    return str(DATA_DIR / f"{safe}_d.csv")
-
-
-def stooq_daily_csv_url(provider_symbol: str) -> str:
-    """
-    Stooq daily CSV endpoint:
-    https://stooq.com/q/d/l/?s=aapl.us&i=d
-    """
-    s = stooq_symbol_for_url(provider_symbol)
-    return f"https://stooq.com/q/d/l/?s={s}&i=d"
-
-
-def extract_stooq_csv(provider_symbol: str, force: bool = False) -> str:
-    """
-    Downloads the daily CSV for provider_symbol into data/ and returns the local path.
-    Uses a cache check + atomic write to avoid partial/corrupt files.
-    """
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-    url = stooq_daily_csv_url(provider_symbol)
-    out_path = csv_path_for_symbol(provider_symbol)
-
-    out_p = Path(out_path)
-
-    # 1) Cache: if we already have a non-trivial file, reuse it
-    if (not force) and out_p.exists() and out_p.stat().st_size > 100:
-        print(f"cached: {provider_symbol} -> {out_path}")
-        return out_path
-
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": "Mozilla/5.0 (compatible; daily-stock-pipeline/1.0)"}
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            content = resp.read()
-
-        # 2) Stooq sometimes returns an HTML error page; quick sanity check.
-        head = content[:300].lower()
-        if (
-            not content
-            or b"<html" in head
-            or b"<!doctype html" in head
-        ):
-            raise RuntimeError(f"Unexpected response when downloading {provider_symbol} from Stooq.")
-
-        # 3) Atomic write: write to .tmp then rename into place
-        tmp_path = out_p.with_suffix(out_p.suffix + ".tmp")  # e.g. aapl_us_d.csv.tmp
-        tmp_path.write_bytes(content)
-        tmp_path.replace(out_p)
-
-        print(f"downloaded: {provider_symbol} -> {out_path} ({len(content)} bytes)")
-        return out_path
-
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP error downloading {provider_symbol}: {e.code} {e.reason}") from e
-    except urllib.error.URLError as e:
-        raise RuntimeError(f"Network error downloading {provider_symbol}: {e.reason}") from e
 
 def insert_run_start(conn: sqlite3.Connection, run_id: str, started_at: str, symbols_total: int) -> None:
     conn.execute("""
@@ -924,6 +839,78 @@ def finalize_symbol(
         raw_count, stg_count, ins, upd, same, error_message,
         run_id, provider, provider_symbol
     ))
+
+def stooq_symbol_for_url(provider_symbol: str) -> str:
+    """
+    Stooq expects lowercase symbols in the URL, e.g. 'AAPL.US' -> 'aapl.us'
+    """
+    return provider_symbol.strip().lower()
+
+
+def csv_path_for_symbol(provider_symbol: str) -> str:
+    """
+    Your file naming convention: 'AAPL.US' -> 'data/aapl_us_d.csv'
+    """
+    safe = provider_symbol.strip().lower().replace(".", "_")
+    return str(DATA_DIR / f"{safe}_d.csv")
+
+
+def stooq_daily_csv_url(provider_symbol: str) -> str:
+    """
+    Stooq daily CSV endpoint:
+    https://stooq.com/q/d/l/?s=aapl.us&i=d
+    """
+    s = stooq_symbol_for_url(provider_symbol)
+    return f"https://stooq.com/q/d/l/?s={s}&i=d"
+
+
+def extract_stooq_csv(provider_symbol: str, force: bool = False) -> str:
+    """
+    Downloads the daily CSV for provider_symbol into data/ and returns the local path.
+    Uses a cache check + atomic write to avoid partial/corrupt files.
+    """
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    url = stooq_daily_csv_url(provider_symbol)
+    out_path = csv_path_for_symbol(provider_symbol)
+
+    out_p = Path(out_path)
+
+    # 1) Cache: if we already have a non-trivial file, reuse it
+    if (not force) and out_p.exists() and out_p.stat().st_size > 100:
+        print(f"cached: {provider_symbol} -> {out_path}")
+        return out_path
+
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; daily-stock-pipeline/1.0)"}
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read()
+
+        # 2) Stooq sometimes returns an HTML error page; quick sanity check.
+        head = content[:300].lower()
+        if (
+            not content
+            or b"<html" in head
+            or b"<!doctype html" in head
+        ):
+            raise RuntimeError(f"Unexpected response when downloading {provider_symbol} from Stooq.")
+
+        # 3) Atomic write: write to .tmp then rename into place
+        tmp_path = out_p.with_suffix(out_p.suffix + ".tmp")  # e.g. aapl_us_d.csv.tmp
+        tmp_path.write_bytes(content)
+        tmp_path.replace(out_p)
+
+        print(f"downloaded: {provider_symbol} -> {out_path} ({len(content)} bytes)")
+        return out_path
+
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP error downloading {provider_symbol}: {e.code} {e.reason}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error downloading {provider_symbol}: {e.reason}") from e
 
 def main(force_download: bool = False, verbose: bool = False):
     run_id = make_run_id()
