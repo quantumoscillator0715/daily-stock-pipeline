@@ -1,6 +1,8 @@
 import csv
+import sqlite3
+from daily_stock.util import utc_now_iso, compute_row_hash, parse_yyyy_mm_dd
 
-def load_csv_to_raw(conn: sqlite3.Connection, csv_path: str, provider_symbol: str, run_id: str, date_from: str, date_to: str) -> int:
+def load_csv_to_raw(conn: sqlite3.Connection, csv_path: str, provider: str, provider_symbol: str, run_id: str, date_from: str, date_to: str) -> int:
     """
     Read the Stooq CSV and append rows into RAW.
     Returns number of inserted rows.
@@ -33,7 +35,7 @@ def load_csv_to_raw(conn: sqlite3.Connection, csv_path: str, provider_symbol: st
             volume_s = row["Volume"]
 
             row_hash = compute_row_hash(
-                PROVIDER,
+                provider=provider,
                 provider_symbol=provider_symbol,
                 trading_date=trading_date,
                 open_s=open_s,
@@ -51,7 +53,7 @@ def load_csv_to_raw(conn: sqlite3.Connection, csv_path: str, provider_symbol: st
                     source_url, ingested_at, run_id, row_hash
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             """, (
-                PROVIDER, provider_symbol, trading_date,
+                provider, provider_symbol, trading_date,
                 float(open_s), float(high_s), float(low_s), float(close_s), float(volume_s),
                 source_url, ingested_at, run_id, row_hash
             ))
@@ -61,6 +63,6 @@ def load_csv_to_raw(conn: sqlite3.Connection, csv_path: str, provider_symbol: st
     cur = conn.execute("""
         SELECT COUNT(*)
         FROM raw_stooq_daily_prices
-        WHERE run_id = ? AND provider_symbol = ?;
-    """, (run_id, provider_symbol))
+        WHERE run_id = ? AND provider = ? AND provider_symbol = ?;
+    """, (run_id, provider, provider_symbol))
     return cur.fetchone()[0]
