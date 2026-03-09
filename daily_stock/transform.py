@@ -5,9 +5,6 @@ def rebuild_staging_for_run_symbol(conn: sqlite3.Connection, run_id: str, provid
     """
     Rebuild STG for ONE symbol and ONE run_id.
     """
-    print("DEBUG transform file:", __file__)
-    print("DEBUG utc_now_iso in globals:", "utc_now_iso" in globals())
-    print("DEBUG utc_now_iso object:", globals().get("utc_now_iso"))
     
     stg_ingested_at = utc_now_iso()
 
