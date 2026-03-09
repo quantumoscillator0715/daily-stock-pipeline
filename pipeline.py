@@ -1,9 +1,8 @@
 import sqlite3
 import argparse
-import math
-from datetime import datetime, timezone, date, timedelta
+from datetime import datetime, timezone, timedelta
 
-from daily_stock.util import utc_now_iso, make_run_id, compute_row_hash, parse_yyyy_mm_dd, iso_yyyy_mm_dd
+from daily_stock.util import utc_now_iso, make_run_id, parse_yyyy_mm_dd, iso_yyyy_mm_dd
 from daily_stock.extract import extract_stooq_csv
 from daily_stock.db import init_db
 from daily_stock.load import load_csv_to_raw
@@ -11,8 +10,10 @@ from daily_stock.transform import rebuild_staging_for_run_symbol, merge_stg_to_c
 from daily_stock.runlog import insert_run_start, finalize_run, insert_symbol_start, finalize_symbol
 from daily_stock.watermarks import get_last_success_date, upsert_watermark_success, upsert_watermark_failed
 from daily_stock.watchlist import get_active_watchlist, upsert_watchlist_symbol, mark_removed_watchlist, seed_watchlist_if_empty
+from daily_stock.report import fetch_watchlist_report, print_watchlist_report
 
-#constants
+
+#Constants
 SAFETY_DAYS = 10
 DB_PATH = "stock.db"
 PROVIDER = "stooq"
@@ -83,13 +84,6 @@ def run_one_symbol(conn: sqlite3.Connection, provider_symbol: str, run_id: str, 
         print("raw rows for this run+symbol:", raw_count)
         print("stg rows for this run:", stg_count)
 
-        rev_cnt_run = conn.execute("""
-            SELECT COUNT(*)
-            FROM cur_daily_prices
-            WHERE provider = ? AND provider_symbol = ? AND is_revised = 1 AND last_run_id = ?;
-        """, (PROVIDER, provider_symbol, run_id)).fetchone()[0]
-        print("curated revised rows (this run):", rev_cnt_run)
-
         if verbose:
             print("\nRAW sample:")
             for r in conn.execute("""
@@ -112,7 +106,7 @@ def run_one_symbol(conn: sqlite3.Connection, provider_symbol: str, run_id: str, 
                 print(r)
 
     except Exception as e:
-        # Finalize symbol log (failed) — keep counts 0 because we may fail before load starts
+        # Finalize symbol log (failed) with whatever counts were reached so far
         finalize_symbol(
             conn,
             run_id=run_id,
@@ -134,7 +128,7 @@ def run_one_symbol(conn: sqlite3.Connection, provider_symbol: str, run_id: str, 
 
 
 
-def main(force_download: bool = False, verbose: bool = False):
+def main(force_download: bool = False, verbose: bool = False) -> None:
     run_id = make_run_id()
 
     with sqlite3.connect(DB_PATH) as conn:
@@ -192,41 +186,8 @@ if __name__ == "__main__":
         print(f"Removed/deactivated {args.remove_symbol}")
     elif args.report:
         with sqlite3.connect(DB_PATH) as conn:
-            init_db(conn)  # ensures views exist
-
-            rows = conn.execute("""
-                SELECT provider_symbol, latest_date, latest_close, daily_return, sma_20, sma_50, var_20d
-                FROM vw_watchlist_report
-                ORDER BY provider_symbol;
-            """).fetchall()
-            
-        print("\n=== Watchlist Report ===")
-        print("symbol | date | close | ret% | sma20 | sma50 | vol20%")
-        
-        for sym, dt, close, ret, sma20, sma50, var20 in rows:
-            vol20 = None
-            if var20 is not None and var20 > 0:
-                vol20 = math.sqrt(var20)
-
-            ret_pct = None if ret is None else ret * 100.0
-            vol_pct = None if vol20 is None else vol20 * 100.0
-
-            # format nicely; keep blanks for None
-            def fmt(x, nd=2):
-                if x is None:
-                    return ""
-                if isinstance(x, (int, float)):
-                    return f"{x:.{nd}f}"
-                return str(x)
-        
-            print(" | ".join([
-                sym,
-                dt,
-                fmt(close, 2),
-                fmt(ret_pct, 2),
-                fmt(sma20, 2),
-                fmt(sma50, 2),
-                fmt(vol_pct, 2),
-            ]))
+            init_db(conn)
+            rows = fetch_watchlist_report(conn)
+        print_watchlist_report(rows)
     else:
         main(force_download=args.refresh, verbose=args.verbose)

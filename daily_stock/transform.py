@@ -159,6 +159,7 @@ def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str, provider: str, p
       )
     WHERE c.provider = ?
       AND c.provider_symbol = ?
+      AND c.last_run_id <> ?
       AND EXISTS (
         SELECT 1
         FROM stg_daily_prices AS s
@@ -170,9 +171,9 @@ def merge_stg_to_curated(conn: sqlite3.Connection, run_id: str, provider: str, p
           AND s.row_hash = c.row_hash
       );
     """, (
-        run_id, provider, provider_symbol,          # subquery params
-        provider, provider_symbol,                  # outer row filter
-        run_id, provider, provider_symbol           # EXISTS params
+        run_id, provider, provider_symbol,
+        provider, provider_symbol, run_id,
+        run_id, provider, provider_symbol
     ))
     unchanged = conn.execute("SELECT changes();").fetchone()[0]
 

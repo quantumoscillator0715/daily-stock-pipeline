@@ -27,7 +27,8 @@ def get_active_watchlist(conn: sqlite3.Connection, provider: str) -> list[str]:
 def upsert_watchlist_symbol(
     conn: sqlite3.Connection,
     provider: str,
-    provider_symbol: str
+    provider_symbol: str,
+    notes: str | None = None
 ) -> None:
     now = utc_now_iso()
     
@@ -39,8 +40,8 @@ def upsert_watchlist_symbol(
         VALUES (?, ?, 1, ?, NULL, ?)
         ON CONFLICT(provider, provider_symbol) DO UPDATE SET
             is_active = 1,
-            removed_at = NULL;
-            notes = COALESCE(excluded.notes, watchlist_symbols.notes);
+            removed_at = NULL,
+            notes = COALESCE(excluded.notes, watchlist_symbols.notes)
         """,
         (provider, provider_symbol, now, notes)
     )
